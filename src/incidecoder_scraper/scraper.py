@@ -475,6 +475,7 @@ class IncidecoderScraper:
         """Fetch the brand directory and populate the brand queue."""
 
         LOGGER.info("Refreshing brand directory")
+        store.reset_brand_processing()
         offset = 0
         page_size: Optional[int] = None
         while True:
