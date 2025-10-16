@@ -148,6 +148,47 @@ class LinkCollector(HTMLParser):
                 break
 
 
+class NamedLinkCollector(HTMLParser):
+    """Collect anchor hrefs with their text content for matching prefixes."""
+
+    def __init__(self, prefixes: Sequence[str]) -> None:
+        super().__init__()
+        self.prefixes = tuple(prefixes)
+        self.links: List[Tuple[str, str]] = []
+        self._current_href: Optional[str] = None
+        self._buffer: List[str] = []
+        self._seen: Set[str] = set()
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        if tag != "a":
+            return
+        attr_map = dict(attrs)
+        href = attr_map.get("href")
+        if not href:
+            return
+        for prefix in self.prefixes:
+            if href.startswith(prefix):
+                sanitized = href.split("#", 1)[0]
+                if sanitized in self._seen:
+                    return
+                self._current_href = sanitized
+                self._buffer = []
+                return
+
+    def handle_data(self, data: str) -> None:
+        if self._current_href is not None:
+            self._buffer.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag != "a" or self._current_href is None:
+            return
+        text = "".join(self._buffer).strip()
+        self._seen.add(self._current_href)
+        self.links.append((self._current_href, text))
+        self._current_href = None
+        self._buffer = []
+
+
 @dataclass
 class Ingredient:
     """Structured ingredient information."""
@@ -427,6 +468,48 @@ class IncidecoderScraper:
         self.base_url = base_url.rstrip("/")
         self.http = http_client or HttpClient(base_url=self.base_url)
 
+    # ------------------------------------------------------------------
+    # Brand discovery helpers
+
+    def build_brand_queue(self, store: "DataStore") -> None:
+        """Fetch the brand directory and populate the brand queue."""
+
+        LOGGER.info("Refreshing brand directory")
+        offset = 0
+        page_size: Optional[int] = None
+        while True:
+            path = f"/brands?offset={offset}"
+            try:
+                html = self.http.fetch(path)
+            except Exception as exc:  # pragma: no cover - network behaviour
+                LOGGER.warning("Failed to fetch brand index %s: %s", path, exc)
+                break
+            collector = NamedLinkCollector(("/brand/",))
+            collector.feed(html)
+            brands: List[Tuple[str, str]] = []
+            for href, name in collector.links:
+                absolute = self.http.build_url(href)
+                clean_name = name.strip() if name.strip() else self._humanize_slug(href)
+                brands.append((clean_name, absolute))
+            if not brands:
+                LOGGER.info("No brands discovered at offset %d; stopping", offset)
+                break
+            inserted = store.add_brands(brands)
+            LOGGER.debug(
+                "Processed brand page offset=%d: %d entries (%d new)",
+                offset,
+                len(brands),
+                inserted,
+            )
+            if page_size is None:
+                page_size = len(brands)
+            if page_size == 0:
+                break
+            offset += page_size
+            if len(brands) < page_size:
+                LOGGER.info("Reached final brand page at offset %d", offset)
+                break
+
     def discover_product_urls(self, strategy: str = "auto") -> Generator[str, None, None]:
         strategies: List[Tuple[str, Generator[str, None, None]]] = []
         if strategy in {"auto", "sitemap"}:
@@ -503,12 +586,16 @@ class IncidecoderScraper:
                     break
                 for brand_link in brand_links:
                     visited_brands.add(brand_link)
-                    yield from self._discover_products_for_brand(brand_link)
+                    for product_url, _ in self._discover_products_for_brand(brand_link):
+                        yield product_url
                 page += 1
 
-    def _discover_products_for_brand(self, brand_url: str) -> Generator[str, None, None]:
+    def _discover_products_for_brand(
+        self, brand_url: str
+    ) -> Generator[Tuple[str, Optional[str]], None, None]:
         seen_pages: Set[str] = set()
         queue = [brand_url]
+        seen_products: Set[str] = set()
         while queue:
             current_url = queue.pop(0)
             if current_url in seen_pages:
@@ -519,10 +606,15 @@ class IncidecoderScraper:
             except Exception as exc:  # pragma: no cover - network behaviour
                 LOGGER.warning("Failed to fetch brand page %s: %s", current_url, exc)
                 continue
-            product_collector = LinkCollector(("/products/",))
+            product_collector = NamedLinkCollector(("/products/",))
             product_collector.feed(html)
-            for link in product_collector.links:
-                yield self.http.build_url(link)
+            for link, name in product_collector.links:
+                absolute = self.http.build_url(link)
+                if absolute in seen_products:
+                    continue
+                seen_products.add(absolute)
+                clean_name = name.strip() if name.strip() else self._humanize_slug(link)
+                yield absolute, clean_name
             pagination_collector = LinkCollector(("?page=",))
             pagination_collector.feed(html)
             for link in pagination_collector.links:
@@ -535,6 +627,9 @@ class IncidecoderScraper:
         parser = ProductHTMLParser(self.base_url)
         return parser.parse(html, url)
 
+    # ------------------------------------------------------------------
+    # Scraping pipelines
+
     def scrape(
         self,
         store: "DataStore",
@@ -543,8 +638,64 @@ class IncidecoderScraper:
         strategy: str = "auto",
         resume: bool = True,
     ) -> None:
+        if strategy == "sitemap":
+            self._scrape_via_direct_discovery(store, limit=limit, resume=resume)
+            return
+        self._scrape_via_brand_pipeline(store, limit=limit, resume=resume)
+
+    def _scrape_via_brand_pipeline(
+        self,
+        store: "DataStore",
+        *,
+        limit: Optional[int],
+        resume: bool,
+    ) -> None:
+        self.build_brand_queue(store)
+        for brand_id, name, url in store.iter_pending_brands():
+            LOGGER.info("Discovering products for brand %s", name)
+            products = list(self._discover_products_for_brand(url))
+            new_count = store.add_products_for_brand(brand_id, products)
+            LOGGER.info(
+                "Queued %d products for brand %s", new_count, name
+            )
+            store.mark_brand_processed(brand_id)
+
         count = 0
-        for product_url in self.discover_product_urls(strategy=strategy):
+        for product_id, product_url, product_name, brand_name in store.iter_products_to_scrape(
+            resume=resume
+        ):
+            if limit is not None and count >= limit:
+                LOGGER.info("Reached limit of %d products; stopping", limit)
+                break
+            if resume and store.has_product(product_url):
+                LOGGER.debug("Skipping already stored product %s", product_url)
+                continue
+            try:
+                product = self.fetch_product(product_url)
+            except Exception as exc:  # pragma: no cover - network behaviour
+                LOGGER.error("Failed to scrape %s: %s", product_url, exc)
+                continue
+            if not product.name and product_name:
+                product.name = product_name
+            if not product.brand and brand_name:
+                product.brand = brand_name
+            store.save_product(product)
+            count += 1
+            LOGGER.info(
+                "Stored product %s (%d ingredients)",
+                product_url,
+                len(product.ingredients),
+            )
+
+    def _scrape_via_direct_discovery(
+        self,
+        store: "DataStore",
+        *,
+        limit: Optional[int],
+        resume: bool,
+    ) -> None:
+        count = 0
+        for product_url in self.discover_product_urls(strategy="sitemap"):
             if limit is not None and count >= limit:
                 LOGGER.info("Reached limit of %d products; stopping", limit)
                 break
@@ -558,7 +709,19 @@ class IncidecoderScraper:
                 continue
             store.save_product(product)
             count += 1
-            LOGGER.info("Stored product %s (%d ingredients)", product_url, len(product.ingredients))
+            LOGGER.info(
+                "Stored product %s (%d ingredients)",
+                product_url,
+                len(product.ingredients),
+            )
+
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _humanize_slug(url: str) -> str:
+        slug = url.rstrip("/").split("/")[-1]
+        slug = slug.replace("-", " ").strip()
+        return slug.title() if slug else slug
 
 
 from .storage import DataStore  # noqa: E402  (circular import guard)
