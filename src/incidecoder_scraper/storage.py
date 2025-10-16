@@ -123,20 +123,35 @@ class DataStore:
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
         column_lower = column.lower()
+        def _is_duplicate_column_error(exc: Exception) -> bool:
+            message = str(exc).lower()
+            return "duplicate column" in message or "column with name" in message
+
         if self.backend == "duckdb":
             query = (
                 "SELECT 1 FROM information_schema.columns WHERE lower(table_name) = ? AND lower(column_name) = ? LIMIT 1"
             )
             exists = self.conn.execute(query, [table.lower(), column_lower]).fetchone()
             if not exists:
-                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+                try:
+                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+                except Exception as exc:  # pragma: no cover - duckdb specific exceptions
+                    if not _is_duplicate_column_error(exc):
+                        raise
+                    LOGGER.debug("Column %s already exists on %s (duckdb)", column, table)
         else:
             cur = self.conn.execute(f"PRAGMA table_info({table})")
             columns = {row[1].lower() for row in cur.fetchall()}
             cur.close()
             if column_lower not in columns:
-                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-                self.conn.commit()
+                try:
+                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+                    self.conn.commit()
+                except sqlite3.OperationalError as exc:
+                    if not _is_duplicate_column_error(exc):
+                        raise
+                    LOGGER.debug("Column %s already exists on %s (sqlite)", column, table)
+                    self.conn.rollback()
 
     def save_product(self, product: Product) -> None:
         timestamp = _dt.datetime.utcnow().replace(microsecond=0)
