@@ -50,6 +50,9 @@ class DataStore:
                     rating_value DOUBLE,
                     rating_count BIGINT,
                     categories TEXT,
+                    materials TEXT,
+                    functions TEXT,
+                    highlights TEXT,
                     json_ld TEXT,
                     last_scraped TIMESTAMP
                 )
@@ -79,6 +82,9 @@ class DataStore:
                     rating_value REAL,
                     rating_count INTEGER,
                     categories TEXT,
+                    materials TEXT,
+                    functions TEXT,
+                    highlights TEXT,
                     json_ld TEXT,
                     last_scraped TEXT
                 )
@@ -97,6 +103,7 @@ class DataStore:
             )
             cur.close()
             self.conn.commit()
+        self._ensure_product_columns()
 
     def has_product(self, url: str) -> bool:
         query = "SELECT 1 FROM products WHERE url = ? LIMIT 1"
@@ -105,9 +112,38 @@ class DataStore:
         cur.close()
         return row is not None
 
+    def _ensure_product_columns(self) -> None:
+        required_columns = [
+            ("materials", "TEXT"),
+            ("functions", "TEXT"),
+            ("highlights", "TEXT"),
+        ]
+        for column, definition in required_columns:
+            self._ensure_column("products", column, definition)
+
+    def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        column_lower = column.lower()
+        if self.backend == "duckdb":
+            query = (
+                "SELECT 1 FROM information_schema.columns WHERE lower(table_name) = ? AND lower(column_name) = ? LIMIT 1"
+            )
+            exists = self.conn.execute(query, [table.lower(), column_lower]).fetchone()
+            if not exists:
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        else:
+            cur = self.conn.execute(f"PRAGMA table_info({table})")
+            columns = {row[1].lower() for row in cur.fetchall()}
+            cur.close()
+            if column_lower not in columns:
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+                self.conn.commit()
+
     def save_product(self, product: Product) -> None:
         timestamp = _dt.datetime.utcnow().replace(microsecond=0)
         categories = json.dumps(product.categories)
+        materials = json.dumps(product.materials, ensure_ascii=False)
+        functions = json.dumps(product.functions, ensure_ascii=False)
+        highlights = json.dumps(product.highlights, ensure_ascii=False)
         json_ld = json.dumps(product.json_ld, ensure_ascii=False) if product.json_ld else None
         if self.backend == "duckdb":
             self.conn.execute("BEGIN TRANSACTION")
@@ -117,8 +153,9 @@ class DataStore:
                 """
                 INSERT INTO products (
                     url, name, brand, description, image_url,
-                    rating_value, rating_count, categories, json_ld, last_scraped
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    rating_value, rating_count, categories, materials, functions,
+                    highlights, json_ld, last_scraped
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     product.url,
@@ -129,6 +166,9 @@ class DataStore:
                     product.rating_value,
                     product.rating_count,
                     categories,
+                    materials,
+                    functions,
+                    highlights,
                     json_ld,
                     timestamp,
                 ],
@@ -160,8 +200,9 @@ class DataStore:
                 """
                 INSERT INTO products (
                     url, name, brand, description, image_url,
-                    rating_value, rating_count, categories, json_ld, last_scraped
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    rating_value, rating_count, categories, materials, functions,
+                    highlights, json_ld, last_scraped
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     product.url,
@@ -172,6 +213,9 @@ class DataStore:
                     product.rating_value,
                     product.rating_count,
                     categories,
+                    materials,
+                    functions,
+                    highlights,
                     json_ld,
                     timestamp.isoformat(),
                 ],
@@ -199,13 +243,29 @@ class DataStore:
 
     def iter_products(self) -> Iterable[Product]:
         cur = self.conn.execute(
-            "SELECT url, name, brand, description, image_url, rating_value, rating_count, categories, json_ld FROM products"
+            "SELECT url, name, brand, description, image_url, rating_value, rating_count, categories, materials, functions, highlights, json_ld FROM products"
         )
         rows = cur.fetchall()
         cur.close()
         for row in rows:
-            url, name, brand, description, image_url, rating_value, rating_count, categories_json, json_ld_json = row
+            (
+                url,
+                name,
+                brand,
+                description,
+                image_url,
+                rating_value,
+                rating_count,
+                categories_json,
+                materials_json,
+                functions_json,
+                highlights_json,
+                json_ld_json,
+            ) = row
             categories = json.loads(categories_json) if categories_json else []
+            materials = json.loads(materials_json) if materials_json else []
+            functions = json.loads(functions_json) if functions_json else []
+            highlights = json.loads(highlights_json) if highlights_json else []
             json_ld = json.loads(json_ld_json) if json_ld_json else None
             ingredients = list(self._load_ingredients(url))
             yield Product(
@@ -217,6 +277,9 @@ class DataStore:
                 rating_value=rating_value,
                 rating_count=rating_count,
                 categories=categories,
+                materials=materials,
+                functions=functions,
+                highlights=highlights,
                 json_ld=json_ld,
                 ingredients=ingredients,
             )

@@ -61,6 +61,118 @@ class ProductHTMLParserTests(unittest.TestCase):
             ],
         )
         self.assertIsNotNone(product.json_ld)
+        self.assertEqual(product.materials, [])
+        self.assertEqual(product.functions, [])
+        self.assertEqual(product.highlights, [])
+
+    def test_parses_detailpage_sections(self) -> None:
+        html = """
+        <html>
+          <head>
+            <meta property=\"og:title\" content=\"Detail Serum\" />
+            <meta name=\"description\" content=\"Fallback description\" />
+          </head>
+          <body>
+            <div class=\"detailpage\">
+              <h1>Detail Serum</h1>
+              <section class=\"detailpage__description\">
+                <p>Luxurious hydration booster.</p>
+                <p>Leaves skin feeling soft.</p>
+              </section>
+              <section class=\"detailpage__materials\">
+                <ul>
+                  <li>Bio-Ceramide Complex</li>
+                  <li>Peptide Blend</li>
+                </ul>
+              </section>
+              <section class=\"detailpage__functions\">
+                <div class=\"detailpage__function\" data-function=\"Soothing\">
+                  <h3>Soothing</h3>
+                  <ul>
+                    <li>Calms irritation</li>
+                    <li><a href=\"/function/hydration\">Adds moisture</a></li>
+                  </ul>
+                </div>
+              </section>
+              <section class=\"detailpage__highlights\">
+                <div class=\"detailpage__highlight\">
+                  <h4>Why we love it</h4>
+                  <p>Lightweight texture</p>
+                  <ul><li>Fragrance-free</li></ul>
+                </div>
+              </section>
+              <section class=\"detailpage__ingredients\">
+                <div class=\"detailpage__ingredient\" data-name=\"Betaine\" data-ingredient-url=\"/ingredients/betaine\">
+                  <a href=\"/ingredients/betaine\" data-name=\"Betaine\">Betaine</a>
+                  <div class=\"ingredient-tooltip\" data-title=\"Betaine (Trimethylglycine)\">
+                    <p>Humectant</p>
+                    <a href=\"/ingredient-function/humectant\">Learn more</a>
+                  </div>
+                </div>
+              </section>
+            </div>
+          </body>
+        </html>
+        """
+        product = self.parser.parse(html, "https://incidecoder.com/products/detail-serum")
+        self.assertEqual(product.name, "Detail Serum")
+        self.assertEqual(
+            product.description,
+            "Luxurious hydration booster. Leaves skin feeling soft.",
+        )
+        self.assertEqual(
+            product.materials,
+            ["Bio-Ceramide Complex", "Peptide Blend"],
+        )
+        self.assertEqual(len(product.functions), 1)
+        function_entry = product.functions[0]
+        self.assertEqual(function_entry.get("name"), "Soothing")
+        self.assertEqual(
+            function_entry.get("items"),
+            ["Calms irritation", "Adds moisture"],
+        )
+        self.assertIn(
+            "https://incidecoder.com/function/hydration",
+            function_entry.get("links", []),
+        )
+        self.assertEqual(len(product.highlights), 1)
+        highlight_entry = product.highlights[0]
+        self.assertEqual(highlight_entry.get("title"), "Why we love it")
+        self.assertEqual(highlight_entry.get("text"), "Lightweight texture")
+        self.assertEqual(highlight_entry.get("items"), ["Fragrance-free"])
+        self.assertEqual(len(product.ingredients), 1)
+        ingredient = product.ingredients[0]
+        self.assertEqual(ingredient.name, "Betaine")
+        self.assertEqual(
+            ingredient.extra.get("tooltip_title"),
+            "Betaine (Trimethylglycine)",
+        )
+        self.assertEqual(ingredient.extra.get("tooltip_text"), "Humectant")
+        self.assertEqual(
+            ingredient.extra.get("tooltip_links"),
+            ["https://incidecoder.com/ingredient-function/humectant"],
+        )
+
+    def test_parses_detailpage_variant_root_class(self) -> None:
+        html = """
+        <html>
+          <body>
+            <section class=\"product-detailpage\">
+              <div class=\"detailpage__description\">
+                <p>Balanced hydration.</p>
+              </div>
+              <div class=\"detailpage__materials\">
+                <ul>
+                  <li>Ceramide Complex</li>
+                </ul>
+              </div>
+            </section>
+          </body>
+        </html>
+        """
+        product = self.parser.parse(html, "https://incidecoder.com/products/hydration-balance")
+        self.assertEqual(product.description, "Balanced hydration.")
+        self.assertEqual(product.materials, ["Ceramide Complex"])
 
 
 if __name__ == "__main__":  # pragma: no cover - test runner hook
