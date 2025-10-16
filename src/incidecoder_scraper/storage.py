@@ -203,6 +203,17 @@ class DataStore:
         for brand_id, name, url in rows:
             yield brand_id, name, url
 
+    def reset_brand_processing(self) -> None:
+        """Mark all brands as pending so they will be re-processed."""
+
+        if self.backend == "duckdb":
+            self.conn.execute("UPDATE brands SET processed_at = NULL")
+        else:
+            cur = self.conn.cursor()
+            cur.execute("UPDATE brands SET processed_at = NULL")
+            self.conn.commit()
+            cur.close()
+
     def mark_brand_processed(self, brand_id: int) -> None:
         timestamp = _dt.datetime.utcnow().replace(microsecond=0)
         if self.backend == "duckdb":
